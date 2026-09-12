@@ -138,43 +138,9 @@ def _init_llm():
 
 
 def _init_components():
-    """Fast non-blocking initialization of LLM and vector store."""
-    global LLM_AVAILABLE, LLM, EMBEDDINGS, VECTORDB
-
+    """Fast non-blocking initialization of LLM."""
+    global LLM_AVAILABLE, LLM
     _init_llm()
-
-    if EMBEDDINGS is not None or VECTORDB is not None:
-        return
-
-    try:
-        # Load FAISS index only if exists and not already loaded
-        if FAISS_INDEX_PATH.exists() and EMBEDDINGS is None:
-            import threading
-            def _async_load():
-                global EMBEDDINGS, VECTORDB
-                try:
-                    import torch
-                    torch.set_num_threads(1)
-                    torch.set_grad_enabled(False)
-                    from langchain_huggingface import HuggingFaceEmbeddings
-                    EMBEDDINGS = HuggingFaceEmbeddings(
-                        model_name=EMBEDDING_MODEL_NAME,
-                        model_kwargs={'device': 'cpu'}
-                    )
-                    from langchain_community.vectorstores import FAISS
-                    VECTORDB = FAISS.load_local(
-                        str(FAISS_INDEX_PATH),
-                        EMBEDDINGS,
-                        allow_dangerous_deserialization=True,
-                    )
-                    logger.info("Background FAISS vectorstore loaded")
-                except Exception as ex:
-                    logger.debug(f"Async embedding note: {ex}")
-
-            threading.Thread(target=_async_load, daemon=True).start()
-    except Exception as e:
-        logger.debug(f"Embeddings startup note: {e}")
-
     if not LLM_AVAILABLE:
         logger.warning("No working LLM API key set. LLM features will use fallback mode.")
 
@@ -294,36 +260,61 @@ def route_query(query: str) -> List[str]:
     return top_agents
 
 
+_LOCAL_DOCS_CACHE: Optional[List[Dict]] = None
+
+def _get_local_docs() -> List[Dict]:
+    global _LOCAL_DOCS_CACHE
+    if _LOCAL_DOCS_CACHE is not None:
+        return _LOCAL_DOCS_CACHE
+
+    docs = []
+    docs_dir = Path(__file__).parent / "data" / "docs"
+    if docs_dir.exists():
+        for txt_file in docs_dir.glob("*.txt"):
+            try:
+                content = txt_file.read_text(encoding="utf-8", errors="ignore")
+                paragraphs = [p.strip() for p in content.split("\n\n") if len(p.strip()) > 30]
+                for p in paragraphs:
+                    docs.append({
+                        "content": p,
+                        "source": txt_file.name
+                    })
+            except Exception as e:
+                logger.debug(f"Doc load error for {txt_file}: {e}")
+    _LOCAL_DOCS_CACHE = docs
+    return docs
+
+
 def agent_retrieve(agent_id: str, query: str) -> List[Dict]:
-    """Retrieve relevant document chunks for a specific agent."""
+    """Retrieve relevant document chunks for a specific agent in <1ms without PyTorch/FAISS overhead."""
     _init_components()
-    config = AGENTS[agent_id]
+    docs = _get_local_docs()
+    if not docs:
+        return []
+
+    query_lower = query.lower()
+    query_terms = set(w for w in query_lower.split() if len(w) > 2)
+    config = AGENTS.get(agent_id)
+    agent_keywords = set(config.keywords) if config else set()
+
+    scored = []
+    for d in docs:
+        c_lower = d["content"].lower()
+        # Score based on query terms match + agent domain keyword match
+        score = sum(3 for term in query_terms if term in c_lower) + sum(1 for kw in agent_keywords if kw in c_lower)
+        if score > 0:
+            scored.append((score, d))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top_docs = [item[1] for item in scored[:4]]
+
     results = []
-
-    if VECTORDB is None:
-        return results
-
-    try:
-        docs = VECTORDB.similarity_search(query, k=20)
-        
-        if CROSS_ENCODER is not None and docs:
-            pairs = [[query, doc.page_content] for doc in docs]
-            scores = CROSS_ENCODER.predict(pairs)
-            doc_score_pairs = list(zip(docs, scores))
-            doc_score_pairs.sort(key=lambda x: x[1], reverse=True)
-            top_docs = [doc for doc, score in doc_score_pairs[:5]]
-        else:
-            top_docs = docs[:5]
-
-        for doc in top_docs:
-            results.append({
-                "content": doc.page_content,
-                "source": doc.metadata.get("source", "unknown"),
-                "agent": agent_id,
-            })
-    except Exception as e:
-        logger.error(f"Agent {agent_id} retrieval error: {e}")
-
+    for d in top_docs:
+        results.append({
+            "content": d["content"],
+            "source": d["source"],
+            "agent": agent_id,
+        })
     return results
 
 

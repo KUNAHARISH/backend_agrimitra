@@ -3,16 +3,12 @@ uvicorn[standard]
 gunicorn
 langchain
 langchain-community
-langchain-huggingface
 langchain-text-splitters
 langchain-groq
 langchain-openai
 langgraph
 langgraph-checkpoint-sqlite
-faiss-cpu
-sentence-transformers
 python-dotenv
-pdfminer.six
 pydantic
 slowapi
 limits
