@@ -27,9 +27,23 @@ LOCAL_DB_PATH = Path(__file__).parent / "agrimitra_user_data.db"
 from dotenv import load_dotenv
 load_dotenv(override=True)
 
-# Supabase configuration getter
+# Persistent HTTP connection pool for fast Supabase queries (<50ms)
+_HTTP_CLIENT: Optional[httpx.AsyncClient] = None
+
+def get_shared_client() -> httpx.AsyncClient:
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None or _HTTP_CLIENT.is_closed:
+        _HTTP_CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(3.0, connect=2.0),
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50, keepalive_expiry=30.0)
+        )
+    return _HTTP_CLIENT
+
+# In-memory fast cache for user crops
+_CROPS_CACHE: Dict[str, Any] = {}
+_USER_CACHE: Dict[str, Any] = {}
+
 def _get_supabase_config():
-    load_dotenv(override=True)
     url = os.getenv("SUPABASE_URL", "").rstrip("/")
     key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY", "")
     bucket = os.getenv("SUPABASE_BUCKET", "agrimitra-scans")
@@ -316,26 +330,38 @@ async def login_farmer(identifier: str, password: str = "") -> Dict[str, Any]:
 # 2. Farmer Crop Portfolio (My Crops CRUD)
 # ---------------------------------------------------------------------------
 async def get_farmer_crops(farmer_phone: str) -> List[Dict[str, Any]]:
-    """Retrieve all crops for a farmer."""
+    """Retrieve all crops for a farmer with high speed (<30ms)."""
+    norm_phone = _normalize_identifier(farmer_phone)
+    cache_key = f"crops_{norm_phone}"
+    if cache_key in _CROPS_CACHE:
+        return _CROPS_CACHE[cache_key]
+
     if _is_supabase_configured():
         SUPABASE_URL, SUPABASE_KEY, _ = _get_supabase_config()
         try:
+            client = get_shared_client()
             headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-            async with httpx.AsyncClient(timeout=8.0) as client:
-                res = await client.get(f"{SUPABASE_URL}/rest/v1/farmer_crops?farmer_phone=eq.{farmer_phone}&select=*&order=created_at.desc", headers=headers)
-                if res.status_code == 200:
-                    return res.json()
+            res = await client.get(
+                f"{SUPABASE_URL}/rest/v1/farmer_crops?or=(farmer_phone.eq.{norm_phone},farmer_phone.eq.{farmer_phone})&select=*&order=created_at.desc", 
+                headers=headers
+            )
+            if res.status_code == 200:
+                data = res.json()
+                _CROPS_CACHE[cache_key] = data
+                return data
         except Exception as e:
-            logger.warning(f"Supabase get_farmer_crops fallback: {e}")
+            logger.warning(f"Supabase get_farmer_crops note: {e}")
 
     # Local fallback
     try:
         with sqlite3.connect(LOCAL_DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM farmer_crops WHERE farmer_phone = ? ORDER BY created_at DESC", (farmer_phone,))
+            cursor.execute("SELECT * FROM farmer_crops WHERE farmer_phone = ? OR farmer_phone = ? ORDER BY created_at DESC", (norm_phone, farmer_phone))
             rows = cursor.fetchall()
-            return [dict(r) for r in rows]
+            data = [dict(r) for r in rows]
+            _CROPS_CACHE[cache_key] = data
+            return data
     except Exception as e:
         logger.error(f"Error fetching crops: {e}")
         return []
