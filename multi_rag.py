@@ -66,16 +66,35 @@ CROSS_ENCODER = None
 
 
 def _init_llm():
-    """Initialize remote API LLMs (NVIDIA / Groq / OpenRouter) which use near 0 RAM."""
+    """Initialize remote API LLMs (Groq / NVIDIA / OpenRouter) with ultra-fast sub-second TTFT."""
     global LLM_AVAILABLE, LLM
     if LLM is not None:
         return
 
+    groq_key = os.getenv("GROQ_API_KEY")
     nvidia_key = os.getenv("NVIDIA_API_KEY")
     openrouter_key = os.getenv("OPENROUTER_API_KEY")
-    groq_key = os.getenv("GROQ_API_KEY")
 
-    if nvidia_key:
+    # 1. Primary ultra-fast streaming engine (Groq Qwen 27B / GPT-OSS)
+    if groq_key and groq_key != "your_key_here":
+        try:
+            from langchain_groq import ChatGroq
+            model_name = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+            LLM = ChatGroq(
+                model_name=model_name,
+                groq_api_key=groq_key,
+                temperature=0.3,
+                streaming=True,
+                request_timeout=15.0
+            )
+            LLM_AVAILABLE = True
+            logger.info(f"Groq ultra-fast LLM initialized successfully with model {model_name}")
+            return
+        except Exception as e:
+            logger.warning(f"Failed to initialize Groq LLM: {e}")
+
+    # 2. NVIDIA Nemotron Engine
+    if not LLM_AVAILABLE and nvidia_key:
         try:
             from langchain_openai import ChatOpenAI
             model_name = os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning")
@@ -83,10 +102,10 @@ def _init_llm():
                 base_url="https://integrate.api.nvidia.com/v1",
                 api_key=nvidia_key,
                 model=model_name,
-                temperature=0.6,
-                max_tokens=4096,
-                top_p=0.95,
-                streaming=True
+                temperature=0.3,
+                max_tokens=2048,
+                streaming=True,
+                request_timeout=20.0
             )
             LLM_AVAILABLE = True
             logger.info(f"NVIDIA Nemotron LLM initialized successfully with model {model_name}")
@@ -94,21 +113,7 @@ def _init_llm():
         except Exception as e:
             logger.warning(f"Failed to initialize NVIDIA LLM: {e}")
 
-    if not LLM_AVAILABLE and groq_key:
-        try:
-            from langchain_groq import ChatGroq
-            LLM = ChatGroq(
-                model_name=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-                groq_api_key=groq_key,
-                temperature=0.3,
-                streaming=True,
-            )
-            LLM_AVAILABLE = True
-            logger.info("Groq LLM initialized successfully")
-            return
-        except Exception as e:
-            logger.warning(f"Failed to initialize Groq LLM: {e}")
-
+    # 3. OpenRouter Engine
     if not LLM_AVAILABLE and openrouter_key:
         try:
             from langchain_openai import ChatOpenAI
@@ -122,7 +127,8 @@ def _init_llm():
                 default_headers={
                     "HTTP-Referer": "https://agrimitra.ai",
                     "X-Title": "AgriMitra AI"
-                }
+                },
+                request_timeout=20.0
             )
             LLM_AVAILABLE = True
             logger.info(f"OpenRouter LLM initialized successfully with model {model_name}")
@@ -132,38 +138,42 @@ def _init_llm():
 
 
 def _init_components():
-    """Lazy initialization of LLM, embeddings, and vector store."""
-    global LLM_AVAILABLE, LLM, EMBEDDINGS, VECTORDB, CROSS_ENCODER
+    """Fast non-blocking initialization of LLM and vector store."""
+    global LLM_AVAILABLE, LLM, EMBEDDINGS, VECTORDB
 
     _init_llm()
 
     if EMBEDDINGS is not None or VECTORDB is not None:
-        return  # Already initialized
+        return
 
     try:
-        import gc
-        import torch
-        torch.set_num_threads(1)  # Low memory mode
-        torch.set_grad_enabled(False)
-        from langchain_huggingface import HuggingFaceEmbeddings
-        EMBEDDINGS = HuggingFaceEmbeddings(
-            model_name=EMBEDDING_MODEL_NAME,
-            model_kwargs={'device': 'cpu'}
-        )
-        logger.info(f"Loaded embedding model: {EMBEDDING_MODEL_NAME}")
-        gc.collect()
+        # Load FAISS index only if exists and not already loaded
+        if FAISS_INDEX_PATH.exists() and EMBEDDINGS is None:
+            import threading
+            def _async_load():
+                global EMBEDDINGS, VECTORDB
+                try:
+                    import torch
+                    torch.set_num_threads(1)
+                    torch.set_grad_enabled(False)
+                    from langchain_huggingface import HuggingFaceEmbeddings
+                    EMBEDDINGS = HuggingFaceEmbeddings(
+                        model_name=EMBEDDING_MODEL_NAME,
+                        model_kwargs={'device': 'cpu'}
+                    )
+                    from langchain_community.vectorstores import FAISS
+                    VECTORDB = FAISS.load_local(
+                        str(FAISS_INDEX_PATH),
+                        EMBEDDINGS,
+                        allow_dangerous_deserialization=True,
+                    )
+                    logger.info("Background FAISS vectorstore loaded")
+                except Exception as ex:
+                    logger.debug(f"Async embedding note: {ex}")
 
-        # Load FAISS index if embeddings loaded
-        if FAISS_INDEX_PATH.exists():
-            from langchain_community.vectorstores import FAISS
-            VECTORDB = FAISS.load_local(
-                str(FAISS_INDEX_PATH),
-                EMBEDDINGS,
-                allow_dangerous_deserialization=True,
-            )
-            logger.info(f"Loaded FAISS index from {FAISS_INDEX_PATH}")
+            threading.Thread(target=_async_load, daemon=True).start()
     except Exception as e:
-        logger.warning(f"Embeddings / FAISS in lightweight mode: {e}")
+        logger.debug(f"Embeddings startup note: {e}")
 
     if not LLM_AVAILABLE:
         logger.warning("No working LLM API key set. LLM features will use fallback mode.")
@@ -318,24 +328,31 @@ def agent_retrieve(agent_id: str, query: str) -> List[Dict]:
 
 
 def _web_search(query: str) -> tuple[str, List[str]]:
-    """Use DuckDuckGo to fetch live web data. Returns (context_str, source_list)."""
+    """Use DuckDuckGo to fetch live web data with quick timeout. Returns (context_str, source_list)."""
     try:
         from duckduckgo_search import DDGS
-        logger.info(f"CRAG web search for: {query}")
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=4))
-            if not results:
-                return "", []
+        import concurrent.futures
+        
+        def _run_ddg():
+            with DDGS(timeout=1.0) as ddgs:
+                return list(ddgs.text(query, max_results=2))
 
-            web_sources = []
-            web_context = "\n--- 🌐 Live Web Search (CRAG Corrective Retrieval) ---\n"
-            for r in results:
-                source_domain = r.get('href', 'web').split('/')[2] if 'href' in r else 'web'
-                web_sources.append(source_domain)
-                web_context += f"[Source: {source_domain}]\n{r.get('body', '')}\n\n"
-            return web_context, web_sources
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_run_ddg)
+            results = future.result(timeout=1.0)
+
+        if not results:
+            return "", []
+
+        web_sources = []
+        web_context = "\n--- 🌐 Live Web Search (CRAG Corrective Retrieval) ---\n"
+        for r in results:
+            source_domain = r.get('href', 'web').split('/')[2] if 'href' in r else 'web'
+            web_sources.append(source_domain)
+            web_context += f"[Source: {source_domain}]\n{r.get('body', '')}\n\n"
+        return web_context, web_sources
     except Exception as e:
-        logger.error(f"DuckDuckGo search failed: {e}")
+        logger.debug(f"Web search skipped / timed out: {e}")
         return "", []
 
 
@@ -699,9 +716,9 @@ async def stream_answer(query: str, language: str = "English", session_id: Optio
                 agent_ctx += f"[Source: {Path(d['source']).name}]: {d['content'][:400]}\n"
             context_parts.append(agent_ctx)
 
-    # 4. Live Web Search only if no docs found or live keywords present
-    live_keywords = ["today", "live", "current price", "tomorrow", "forecast", "news", "mandi rate today"]
-    needs_web = len(retrieved_docs) == 0 or any(k in query.lower() for k in live_keywords)
+    # 4. Live Web Search only if explicit live rate/weather keywords present
+    live_keywords = ["today mandi rate", "live price today", "breaking news", "weather today"]
+    needs_web = any(k in query.lower() for k in live_keywords)
     web_context = ""
     if needs_web:
         web_context, web_sources = _web_search(query)
@@ -735,12 +752,38 @@ async def stream_answer(query: str, language: str = "English", session_id: Optio
                 {"type": "text", "text": prompt},
                 {"type": "image_url", "image_url": {"url": image_url}}
             ])]
+            nvidia_key = os.getenv("NVIDIA_API_KEY")
+            if nvidia_key:
+                from langchain_openai import ChatOpenAI
+                active_llm = ChatOpenAI(
+                    base_url="https://integrate.api.nvidia.com/v1",
+                    api_key=nvidia_key,
+                    model=os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"),
+                    temperature=0.2,
+                    max_tokens=2048,
+                    streaming=True
+                )
         else:
             messages = prompt
 
-        # Direct token streaming loop
+        # Direct token streaming loop with reasoning tag filter
+        in_think_block = False
         async for chunk in active_llm.astream(messages):
             token = chunk.content if hasattr(chunk, "content") else str(chunk)
+            if not token:
+                continue
+
+            # Strip out internal reasoning <think>...</think> tags if model emits them
+            if "<think>" in token:
+                in_think_block = True
+                token = token.split("<think>")[0]
+            if in_think_block:
+                if "</think>" in token:
+                    in_think_block = False
+                    token = token.split("</think>")[-1]
+                else:
+                    continue
+
             if token:
                 full_answer_chunks.append(token)
                 yield f"data: {json.dumps({'chunk': token}, ensure_ascii=False)}\n\n"
@@ -753,7 +796,7 @@ async def stream_answer(query: str, language: str = "English", session_id: Optio
         if groq_key and groq_key != "your_key_here":
             try:
                 from langchain_groq import ChatGroq
-                fallback_model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+                fallback_model = "openai/gpt-oss-120b"
                 fallback_llm = ChatGroq(model_name=fallback_model, groq_api_key=groq_key, temperature=0.3, max_tokens=1500)
                 async for chunk in fallback_llm.astream(prompt):
                     token = chunk.content if hasattr(chunk, "content") else str(chunk)
@@ -835,3 +878,11 @@ def get_all_agents() -> List[Dict]:
         }
         for config in AGENTS.values()
     ]
+
+
+# Eager warm initialization of LLM components on startup
+try:
+    _init_components()
+except Exception as e:
+    logger.debug(f"Eager startup note: {e}")
+

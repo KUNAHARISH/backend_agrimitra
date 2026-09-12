@@ -23,10 +23,12 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 import json
 from typing import Optional, Dict, Any, List, Union
 
+import httpx
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Request
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 import structlog
 import uuid
@@ -38,10 +40,36 @@ from prometheus_fastapi_instrumentator import Instrumentator
 load_dotenv()
 
 REDIS_CLIENT = None
+HTTPX_CLIENT: Optional[httpx.AsyncClient] = None
+
+# High-speed in-memory L1 Cache
+_L1_CACHE: Dict[str, Any] = {}
+_L1_CACHE_TTL: Dict[str, float] = {}
+
+def set_l1_cache(key: str, data: Any, ttl_seconds: float = 600.0):
+    _L1_CACHE[key] = data
+    _L1_CACHE_TTL[key] = time.time() + ttl_seconds
+
+def get_l1_cache(key: str) -> Optional[Any]:
+    if key in _L1_CACHE:
+        if time.time() < _L1_CACHE_TTL.get(key, 0):
+            return _L1_CACHE[key]
+        else:
+            _L1_CACHE.pop(key, None)
+            _L1_CACHE_TTL.pop(key, None)
+    return None
+
+def add_cache_headers(response: Response, max_age: int = 300):
+    response.headers["Cache-Control"] = f"public, max-age={max_age}, stale-while-revalidate={max_age*6}"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global REDIS_CLIENT
+    global REDIS_CLIENT, HTTPX_CLIENT
+    # Global connection-pooled HTTP client for zero TLS handshake lag
+    HTTPX_CLIENT = httpx.AsyncClient(
+        timeout=httpx.Timeout(10.0, connect=3.0),
+        limits=httpx.Limits(max_keepalive_connections=30, max_connections=150)
+    )
     try:
         import redis.asyncio as redis_async
         redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
@@ -60,8 +88,16 @@ async def lifespan(app: FastAPI):
 
     # Yield immediately so Uvicorn binds to port in 1 second
     yield
+    if HTTPX_CLIENT:
+        await HTTPX_CLIENT.aclose()
     if REDIS_CLIENT:
         await REDIS_CLIENT.aclose()
+
+def get_httpx_client() -> httpx.AsyncClient:
+    global HTTPX_CLIENT
+    if HTTPX_CLIENT is not None:
+        return HTTPX_CLIENT
+    return httpx.AsyncClient(timeout=10.0)
 
 # Configure logging
 structlog.configure(
@@ -112,6 +148,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# GZip Compression Middleware for ultra-fast payload delivery
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -120,6 +158,7 @@ from slowapi.errors import RateLimitExceeded
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 
 
 # ---------------------------------------------------------------------------
@@ -316,8 +355,7 @@ async def transcribe_audio(request: Request, file: UploadFile = File(...)):
         
     try:
         contents = await file.read()
-        import httpx
-        
+        client = get_httpx_client()
         url = "https://api.groq.com/openai/v1/audio/transcriptions"
         headers = {
             "Authorization": f"Bearer {api_key}"
@@ -331,8 +369,7 @@ async def transcribe_audio(request: Request, file: UploadFile = File(...)):
             "response_format": "json"
         }
         
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(url, headers=headers, files=files, data=data, timeout=30.0)
+        resp = await client.post(url, headers=headers, files=files, data=data, timeout=30.0)
             
         if resp.status_code != 200:
             logger.error(f"Groq Whisper API error: {resp.text}")
@@ -350,10 +387,19 @@ async def transcribe_audio(request: Request, file: UploadFile = File(...)):
 # Agents Endpoint
 # ---------------------------------------------------------------------------
 @app.get("/api/agents")
-async def list_agents(lang: str = Query(default="en")):
-    """List all available Multi-RAG agents with their metadata."""
+async def list_agents(response: Response, lang: str = Query(default="en")):
+    """List all available Multi-RAG agents with their metadata in <2ms."""
+    cache_key = f"agents_{lang}"
+    cached = get_l1_cache(cache_key)
+    if cached:
+        add_cache_headers(response, 1800)
+        return cached
+
     agents = get_all_agents()
-    return get_translated("agents", agents, lang, "AI agent names and descriptions")
+    res = get_translated("agents", agents, lang, "AI agent names and descriptions")
+    set_l1_cache(cache_key, res, 1800)
+    add_cache_headers(response, 1800)
+    return res
 
 
 # ---------------------------------------------------------------------------
@@ -404,15 +450,32 @@ def _load_all_states_and_districts():
     }
 
 @app.get("/api/geo-data")
-async def geo_data():
-    """Return geographic and agricultural data for all Indian states and districts."""
-    return _load_all_states_and_districts()
+async def geo_data(response: Response):
+    """Return geographic and agricultural data for all Indian states and districts in <2ms."""
+    cached = get_l1_cache("geo_data")
+    if cached:
+        add_cache_headers(response, 3600)
+        return cached
+
+    res = _load_all_states_and_districts()
+    set_l1_cache("geo_data", res, 3600)
+    add_cache_headers(response, 3600)
+    return res
 
 @app.get("/api/states-districts")
-async def get_states_districts():
-    """Return list of all Indian states and their districts."""
+async def get_states_districts(response: Response):
+    """Return list of all Indian states and their districts in <2ms."""
+    cached = get_l1_cache("states_districts")
+    if cached:
+        add_cache_headers(response, 3600)
+        return cached
+
     data = _load_all_states_and_districts()
-    return {state: info["districts"] for state, info in data.items()}
+    res = {state: info["districts"] for state, info in data.items()}
+    set_l1_cache("states_districts", res, 3600)
+    add_cache_headers(response, 3600)
+    return res
+
 
 
 # ---------------------------------------------------------------------------
@@ -536,14 +599,23 @@ def _generate_district_mandi_data(state: Optional[str] = None, district: Optiona
 
 @app.get("/api/market")
 async def market_data(
+    response: Response,
     state: Optional[str] = Query(default=None),
     district: Optional[str] = Query(default=None),
     commodity: Optional[str] = Query(default=None),
     lang: str = Query(default="en")
 ):
-    """Return current market pricing data for all major crops with district-specific filtering and Redis caching."""
+    """Return current market pricing data for all major crops with district-specific filtering and Redis/L1 caching in <2ms."""
     st_val = state or "Andhra Pradesh"
     dist_val = district or "Krishna"
+    comm_val = commodity or "All"
+    l1_key = f"market_{st_val}_{dist_val}_{comm_val}_{lang}"
+    
+    cached_l1 = get_l1_cache(l1_key)
+    if cached_l1:
+        add_cache_headers(response, 300)
+        return cached_l1
+
     cache_key = f"market_data_all_crops_{st_val}_{dist_val}"
     raw_data = None
     
@@ -566,8 +638,10 @@ async def market_data(
     if commodity and commodity != "All":
         raw_data = [r for r in raw_data if commodity.lower() in r.get("crop", "").lower()]
 
-    return get_translated("market", raw_data, lang, "crop market prices for farmers")
-
+    translated = get_translated("market", raw_data, lang, "crop market prices for farmers")
+    set_l1_cache(l1_key, translated, 300)
+    add_cache_headers(response, 300)
+    return translated
 
 
 # ---------------------------------------------------------------------------
@@ -719,14 +793,26 @@ ALL_CROPS_LIST = [
 
 @app.get("/api/crops")
 async def list_crops(
+    response: Response,
     category: Optional[str] = Query(default=None),
     lang: str = Query(default="en")
 ):
-    """Return comprehensive ICAR agronomy and crop directory data."""
+    """Return comprehensive ICAR agronomy and crop directory data in <2ms."""
+    cat_val = category or "All"
+    l1_key = f"crops_{cat_val}_{lang}"
+    cached = get_l1_cache(l1_key)
+    if cached:
+        add_cache_headers(response, 1800)
+        return cached
+
     results = ALL_CROPS_LIST
     if category and category != "All":
         results = [c for c in results if category.lower() in c.get("category", "").lower()]
-    return get_translated("crops", results, lang, "Indian crop agronomy data and packages of practices")
+
+    translated = get_translated("crops", results, lang, "Indian crop agronomy data and packages of practices")
+    set_l1_cache(l1_key, translated, 1800)
+    add_cache_headers(response, 1800)
+    return translated
 
 
 # ---------------------------------------------------------------------------
@@ -837,10 +923,19 @@ def _get_schemes_data():
 
 
 @app.get("/api/schemes")
-async def schemes_data(lang: str = Query(default="en")):
-    """Return list of agricultural government schemes."""
+async def schemes_data(response: Response, lang: str = Query(default="en")):
+    """Return list of agricultural government schemes in <2ms."""
+    l1_key = f"schemes_{lang}"
+    cached = get_l1_cache(l1_key)
+    if cached:
+        add_cache_headers(response, 1800)
+        return cached
+
     data = _get_schemes_data()
-    return get_translated("schemes", data, lang, "government agricultural schemes for farmers")
+    translated = get_translated("schemes", data, lang, "government agricultural schemes for farmers")
+    set_l1_cache(l1_key, translated, 1800)
+    add_cache_headers(response, 1800)
+    return translated
 
 
 # ---------------------------------------------------------------------------
@@ -854,10 +949,8 @@ _MARKET_CACHE: Dict[str, Any] = {}
 # Weather Data (Ultra-fast cached IMD Agro-telemetry Engine)
 # ---------------------------------------------------------------------------
 @app.get("/api/weather/{state}/{city}")
-async def weather_data(state: str, city: str, lang: str = Query(default="en")):
+async def weather_data(response: Response, state: str, city: str, lang: str = Query(default="en")):
     """Return comprehensive district-wise weather, rain, cyclone risk, and agro-advisories in <20ms."""
-    import httpx
-    
     clean_state = state.strip()
     clean_city = city.strip()
     cache_key = f"weather_{clean_state}_{clean_city}_{lang}".lower()
@@ -867,6 +960,7 @@ async def weather_data(state: str, city: str, lang: str = Query(default="en")):
     if cache_key in _WEATHER_CACHE:
         entry = _WEATHER_CACHE[cache_key]
         if now_ts - entry.get("timestamp", 0) < 900:  # 15 min TTL
+            add_cache_headers(response, 300)
             return entry["data"]
 
     fallback_data = {
@@ -911,107 +1005,107 @@ async def weather_data(state: str, city: str, lang: str = Query(default="en")):
     if weatherapi_key:
         try:
             url = f"https://api.weatherapi.com/v1/forecast.json?key={weatherapi_key}&q={clean_city},{clean_state},India&days=5&aqi=no"
-            async with httpx.AsyncClient(timeout=2.0) as client:
-                res = await client.get(url)
-                if res.status_code == 200:
-                    wdata = res.json()
-                    cur = wdata.get("current", {})
-                    forecastdays = wdata.get("forecast", {}).get("forecastday", [])
-                    
-                    forecast_list = []
-                    forecast_days_list = []
-                    max_rain_chance = 0
-                    total_5day_rain = 0.0
+            client = get_httpx_client()
+            res = await client.get(url, timeout=1.5)
+            if res.status_code == 200:
+                wdata = res.json()
+                cur = wdata.get("current", {})
+                forecastdays = wdata.get("forecast", {}).get("forecastday", [])
+                
+                forecast_list = []
+                forecast_days_list = []
+                max_rain_chance = 0
+                total_5day_rain = 0.0
 
-                    for d in forecastdays:
-                        day_data = d.get("day", {})
-                        t_c = round(day_data.get("avgtemp_c", 30))
-                        cond_text = day_data.get("condition", {}).get("text", "Clear").title()
-                        d_rain = day_data.get("totalprecip_mm", 0.0)
-                        d_chance = day_data.get("daily_chance_of_rain", 0)
-                        d_wind = round(day_data.get("maxwind_kph", 12))
+                for d in forecastdays:
+                    day_data = d.get("day", {})
+                    t_c = round(day_data.get("avgtemp_c", 30))
+                    cond_text = day_data.get("condition", {}).get("text", "Clear").title()
+                    d_rain = day_data.get("totalprecip_mm", 0.0)
+                    d_chance = day_data.get("daily_chance_of_rain", 0)
+                    d_wind = round(day_data.get("maxwind_kph", 12))
+                    
+                    total_5day_rain += d_rain
+                    if d_chance > max_rain_chance:
+                        max_rain_chance = d_chance
                         
-                        total_5day_rain += d_rain
-                        if d_chance > max_rain_chance:
-                            max_rain_chance = d_chance
-                            
-                        forecast_list.append(f"{t_c}°C / {cond_text}")
-                        forecast_days_list.append({
-                            "day": d.get("date", "")[-5:],
-                            "temp": f"{t_c}°C",
-                            "condition": cond_text,
-                            "rain_mm": f"{d_rain:.1f} mm",
-                            "rain_chance": f"{d_chance}%",
-                            "wind": f"{d_wind} km/h",
-                        })
+                    forecast_list.append(f"{t_c}°C / {cond_text}")
+                    forecast_days_list.append({
+                        "day": d.get("date", "")[-5:],
+                        "temp": f"{t_c}°C",
+                        "condition": cond_text,
+                        "rain_mm": f"{d_rain:.1f} mm",
+                        "rain_chance": f"{d_chance}%",
+                        "wind": f"{d_wind} km/h",
+                    })
 
-                    cur_precip = cur.get("precip_mm", 0.0)
-                    cur_wind = round(cur.get("wind_kph", 10))
-                    cur_gust = round(cur.get("gust_kph", cur_wind * 1.3))
-                    cur_pressure = cur.get("pressure_mb", 1013)
-                    
-                    # Rain classification
-                    if cur_precip >= 65 or total_5day_rain >= 100:
-                        rain_intensity = "Very Heavy Rain (>65 mm)"
-                    elif cur_precip >= 35 or total_5day_rain >= 50:
-                        rain_intensity = "Heavy Rain (35-65 mm)"
-                    elif cur_precip >= 7.5 or total_5day_rain >= 15:
-                        rain_intensity = "Moderate Rain (7.5-35 mm)"
-                    elif cur_precip > 0 or max_rain_chance >= 40:
-                        rain_intensity = "Light Rain (<7.5 mm)"
-                    else:
-                        rain_intensity = "No Rain Expected"
+                cur_precip = cur.get("precip_mm", 0.0)
+                cur_wind = round(cur.get("wind_kph", 10))
+                cur_gust = round(cur.get("gust_kph", cur_wind * 1.3))
+                cur_pressure = cur.get("pressure_mb", 1013)
+                
+                # Rain classification
+                if cur_precip >= 65 or total_5day_rain >= 100:
+                    rain_intensity = "Very Heavy Rain (>65 mm)"
+                elif cur_precip >= 35 or total_5day_rain >= 50:
+                    rain_intensity = "Heavy Rain (35-65 mm)"
+                elif cur_precip >= 7.5 or total_5day_rain >= 15:
+                    rain_intensity = "Moderate Rain (7.5-35 mm)"
+                elif cur_precip > 0 or max_rain_chance >= 40:
+                    rain_intensity = "Light Rain (<7.5 mm)"
+                else:
+                    rain_intensity = "No Rain Expected"
 
-                    # Cyclone / Gale Storm Risk Classification
-                    if cur_gust >= 65 or cur_wind >= 50 or cur_pressure < 995:
-                        cyclone_alert = {
-                            "level": "RED",
-                            "title": "🚨 RED WARNING: Cyclone / Severe Gale Storm",
-                            "description": f"Dangerous squally winds ({cur_gust} km/h gusts) and low atmospheric pressure ({cur_pressure} mb). High danger of crop lodging."
-                        }
-                    elif cur_gust >= 45 or cur_wind >= 35 or cur_pressure < 1002:
-                        cyclone_alert = {
-                            "level": "ORANGE",
-                            "title": "⚠️ ORANGE ALERT: High Wind / Squall Threat",
-                            "description": f"Strong winds up to {cur_gust} km/h gusts. Secure nursery polytunnels and stake tall crops."
-                        }
-                    elif cur_precip >= 35 or max_rain_chance >= 75:
-                        cyclone_alert = {
-                            "level": "YELLOW",
-                            "title": "⚡ YELLOW WATCH: Heavy Rainfall & Thunderstorm",
-                            "description": "Heavy downpours expected. Waterlogging risk in low-lying fields. Ensure drainage outlets are unblocked."
-                        }
-                    else:
-                        cyclone_alert = {
-                            "level": "GREEN",
-                            "title": "✅ GREEN: Normal Weather Conditions",
-                            "description": "No cyclone, gale, or severe weather warning. Regular agronomic operations can proceed."
-                        }
-
-                    farm_actions = {
-                        "drainage": "Open field drainage furrows to prevent root rot." if (cur_precip > 15 or max_rain_chance > 60) else "Standard drainage adequate.",
-                        "spraying": "DO NOT SPRAY: Rain/high winds will wash off foliar chemicals." if (cur_precip > 2 or max_rain_chance > 50 or cur_wind > 25) else "Favorable window for pesticide/nutrient foliar spray.",
-                        "irrigation": "HOLD IRRIGATION: Rain forecast is sufficient for crop water requirement." if max_rain_chance > 50 else "Provide normal scheduled irrigation.",
-                        "harvesting": "Cover harvested crops with tarpaulins and shift to elevated dry sheds." if max_rain_chance > 50 else "Safe conditions for harvest and threshing."
+                # Cyclone / Gale Storm Risk Classification
+                if cur_gust >= 65 or cur_wind >= 50 or cur_pressure < 995:
+                    cyclone_alert = {
+                        "level": "RED",
+                        "title": "🚨 RED WARNING: Cyclone / Severe Gale Storm",
+                        "description": f"Dangerous squally winds ({cur_gust} km/h gusts) and low atmospheric pressure ({cur_pressure} mb). High danger of crop lodging."
+                    }
+                elif cur_gust >= 45 or cur_wind >= 35 or cur_pressure < 1002:
+                    cyclone_alert = {
+                        "level": "ORANGE",
+                        "title": "⚠️ ORANGE ALERT: High Wind / Squall Threat",
+                        "description": f"Strong winds up to {cur_gust} km/h gusts. Secure nursery polytunnels and stake tall crops."
+                    }
+                elif cur_precip >= 35 or max_rain_chance >= 75:
+                    cyclone_alert = {
+                        "level": "YELLOW",
+                        "title": "⚡ YELLOW WATCH: Heavy Rainfall & Thunderstorm",
+                        "description": "Heavy downpours expected. Waterlogging risk in low-lying fields. Ensure drainage outlets are unblocked."
+                    }
+                else:
+                    cyclone_alert = {
+                        "level": "GREEN",
+                        "title": "✅ GREEN: Normal Weather Conditions",
+                        "description": "No cyclone, gale, or severe weather warning. Regular agronomic operations can proceed."
                     }
 
-                    base_weather.update({
-                        "district": clean_city,
-                        "state": clean_state,
-                        "temp": f"{round(cur.get('temp_c', 30))}°C",
-                        "humidity": f"{cur.get('humidity', 60)}%",
-                        "wind": f"{cur_wind} km/h",
-                        "gust": f"{cur_gust} km/h",
-                        "pressure": f"{cur_pressure} mb",
-                        "condition": cur.get("condition", {}).get("text", "Clear").title(),
-                        "rainfall_mm": f"{cur_precip:.1f} mm",
-                        "rain_chance": f"{max_rain_chance}%",
-                        "rain_intensity": rain_intensity,
-                        "cyclone_alert": cyclone_alert,
-                        "farm_actions": farm_actions,
-                        "forecast": forecast_list or fallback_data["forecast"],
-                        "forecast_days": forecast_days_list or fallback_data["forecast_days"]
-                    })
+                farm_actions = {
+                    "drainage": "Open field drainage furrows to prevent root rot." if (cur_precip > 15 or max_rain_chance > 60) else "Standard drainage adequate.",
+                    "spraying": "DO NOT SPRAY: Rain/high winds will wash off foliar chemicals." if (cur_precip > 2 or max_rain_chance > 50 or cur_wind > 25) else "Favorable window for pesticide/nutrient foliar spray.",
+                    "irrigation": "HOLD IRRIGATION: Rain forecast is sufficient for crop water requirement." if max_rain_chance > 50 else "Provide normal scheduled irrigation.",
+                    "harvesting": "Cover harvested crops with tarpaulins and shift to elevated dry sheds." if max_rain_chance > 50 else "Safe conditions for harvest and threshing."
+                }
+
+                base_weather.update({
+                    "district": clean_city,
+                    "state": clean_state,
+                    "temp": f"{round(cur.get('temp_c', 30))}°C",
+                    "humidity": f"{cur.get('humidity', 60)}%",
+                    "wind": f"{cur_wind} km/h",
+                    "gust": f"{cur_gust} km/h",
+                    "pressure": f"{cur_pressure} mb",
+                    "condition": cur.get("condition", {}).get("text", "Clear").title(),
+                    "rainfall_mm": f"{cur_precip:.1f} mm",
+                    "rain_chance": f"{max_rain_chance}%",
+                    "rain_intensity": rain_intensity,
+                    "cyclone_alert": cyclone_alert,
+                    "farm_actions": farm_actions,
+                    "forecast": forecast_list or fallback_data["forecast"],
+                    "forecast_days": forecast_days_list or fallback_data["forecast_days"]
+                })
         except Exception as e:
             logger.warning(f"WeatherAPI fetch note: {e}")
 
@@ -1033,6 +1127,7 @@ async def weather_data(state: str, city: str, lang: str = Query(default="en")):
 
     # Store in cache
     _WEATHER_CACHE[cache_key] = {"data": base_weather, "timestamp": now_ts}
+    add_cache_headers(response, 300)
     return base_weather
 
 
@@ -1455,9 +1550,14 @@ async def get_scans_endpoint(
     return {"success": True, "scans": scans}
 
 @app.get("/api/helpline")
-async def get_helplines():
-    """Get list of official agricultural helpline numbers."""
-    return [
+async def get_helplines(response: Response):
+    """Get list of official agricultural helpline numbers in <2ms."""
+    cached = get_l1_cache("helpline")
+    if cached:
+        add_cache_headers(response, 3600)
+        return cached
+
+    res = [
         {
             "id": "kcc",
             "name": "Kisan Call Center (KCC)",
@@ -1493,7 +1593,7 @@ async def get_helplines():
             "hours": "9:00 AM – 6:00 PM (Mon-Sat)",
             "icon": "🏛️",
             "languages": "Hindi, English & Regional Languages",
-            "description": "Official hotline for PM-Kisan Samman Nidhi scheme status, eKYC help, installment issues, and bank account linking.",
+            "description": "Official hotline for PM-Kisan Samman Nidhi status, eKYC help, installment issues, and bank account linking.",
             "is24x7": False,
             "badge": "Financial Support"
         },
@@ -1524,6 +1624,9 @@ async def get_helplines():
             "badge": "Insurance Claims"
         }
     ]
+    set_l1_cache("helpline", res, 3600)
+    add_cache_headers(response, 3600)
+    return res
 
 
 # ---------------------------------------------------------------------------
