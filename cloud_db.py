@@ -113,10 +113,28 @@ def _hash_password(password: str) -> str:
 # ---------------------------------------------------------------------------
 # 1. Farmer Authentication & Profiles (Signup / Login)
 # ---------------------------------------------------------------------------
+def _normalize_identifier(val: str) -> str:
+    """Clean and normalize phone or email."""
+    if not val:
+        return ""
+    val = val.strip()
+    if "@" in val:
+        return val.lower()
+    # Remove all non-digits
+    digits = "".join(ch for ch in val if ch.isdigit())
+    if len(digits) == 12 and digits.startswith("91"):
+        return digits[2:]
+    if len(digits) == 11 and digits.startswith("0"):
+        return digits[1:]
+    return digits or val
+
+
 async def signup_farmer(data: Dict[str, Any]) -> Dict[str, Any]:
     """Register a new farmer account."""
-    phone = data.get("phone", "").strip()
-    email = data.get("email", "").strip()
+    raw_phone = data.get("phone", "")
+    raw_email = data.get("email", "")
+    phone = _normalize_identifier(raw_phone)
+    email = raw_email.strip().lower() if raw_email else ""
     name = data.get("name", "Farmer").strip()
     password = data.get("password", "")
     location = data.get("location", "Vijayawada, Andhra Pradesh")
@@ -128,11 +146,12 @@ async def signup_farmer(data: Dict[str, Any]) -> Dict[str, Any]:
         main_crops_str = str(main_crops)
 
     if not phone and not email:
-        return {"success": False, "error": "Phone number or email is required."}
+        return {"success": False, "error": "Valid 10-digit mobile number or email is required."}
 
     password_hash = _hash_password(password) if password else ""
     farmer_id = str(uuid.uuid4())
     now_iso = datetime.datetime.utcnow().isoformat()
+    unique_email = email or f"{phone}@farmer.agrimitra.ai"
 
     # Try Supabase if configured
     if _is_supabase_configured():
@@ -147,7 +166,7 @@ async def signup_farmer(data: Dict[str, Any]) -> Dict[str, Any]:
             payload = {
                 "id": farmer_id,
                 "phone": phone,
-                "email": email or f"{phone}@farmer.agrimitra.ai",
+                "email": unique_email,
                 "name": name,
                 "location": location,
                 "farm_size": farm_size,
@@ -172,6 +191,13 @@ async def signup_farmer(data: Dict[str, Any]) -> Dict[str, Any]:
                             "storage": "supabase"
                         }
                     }
+                elif res.status_code == 409:
+                    return {
+                        "success": False, 
+                        "error": "An account with this mobile number or email already exists. Please click 'Login' instead."
+                    }
+                else:
+                    logger.warning(f"Supabase signup status {res.status_code}: {res.text}")
         except Exception as e:
             logger.warning(f"Supabase signup fallback: {e}")
 
@@ -179,8 +205,17 @@ async def signup_farmer(data: Dict[str, Any]) -> Dict[str, Any]:
     try:
         with sqlite3.connect(LOCAL_DB_PATH) as conn:
             cursor = conn.cursor()
+            # Check if phone or email already registered locally
+            cursor.execute("SELECT id FROM farmers WHERE phone = ? OR (email != '' AND email = ?)", (phone, email or unique_email))
+            existing = cursor.fetchone()
+            if existing:
+                return {
+                    "success": False,
+                    "error": "An account with this mobile number or email already exists. Please click 'Login' instead."
+                }
+
             cursor.execute("""
-                INSERT OR REPLACE INTO farmers (id, phone, email, password_hash, name, location, farm_size, main_crops, created_at)
+                INSERT INTO farmers (id, phone, email, password_hash, name, location, farm_size, main_crops, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (farmer_id, phone, email, password_hash, name, location, farm_size, main_crops_str, now_iso))
             conn.commit()
@@ -205,7 +240,8 @@ async def signup_farmer(data: Dict[str, Any]) -> Dict[str, Any]:
 
 async def login_farmer(identifier: str, password: str = "") -> Dict[str, Any]:
     """Authenticate farmer by phone/email and password."""
-    clean_id = identifier.strip()
+    raw_id = identifier.strip()
+    norm_id = _normalize_identifier(raw_id)
     pwd_hash = _hash_password(password) if password else ""
 
     # Try Supabase if configured
@@ -217,7 +253,7 @@ async def login_farmer(identifier: str, password: str = "") -> Dict[str, Any]:
                 "Authorization": f"Bearer {SUPABASE_KEY}",
                 "Accept": "application/json"
             }
-            query_url = f"{SUPABASE_URL}/rest/v1/farmers?or=(phone.eq.{clean_id},email.eq.{clean_id})&select=*"
+            query_url = f"{SUPABASE_URL}/rest/v1/farmers?or=(phone.eq.{norm_id},phone.eq.{raw_id},email.eq.{raw_id})&select=*"
             async with httpx.AsyncClient(timeout=10.0) as client:
                 res = await client.get(query_url, headers=headers)
                 if res.status_code == 200:
@@ -247,7 +283,7 @@ async def login_farmer(identifier: str, password: str = "") -> Dict[str, Any]:
         with sqlite3.connect(LOCAL_DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM farmers WHERE phone = ? OR email = ?", (clean_id, clean_id))
+            cursor.execute("SELECT * FROM farmers WHERE phone = ? OR phone = ? OR email = ?", (norm_id, raw_id, raw_id))
             row = cursor.fetchone()
             if row:
                 if password and row["password_hash"] and row["password_hash"] != pwd_hash:
