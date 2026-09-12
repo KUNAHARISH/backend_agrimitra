@@ -65,54 +65,12 @@ VECTORDB = None
 CROSS_ENCODER = None
 
 
-def _init_components():
-    """Lazy initialization of LLM, embeddings, and vector store."""
-    global LLM_AVAILABLE, LLM, EMBEDDINGS, VECTORDB, CROSS_ENCODER
-
-    if EMBEDDINGS is not None:
-        return  # Already initialized
-
-    try:
-        import gc
-        import torch
-        torch.set_num_threads(1)  # Reduce memory usage on Render's 512MB free tier
-        torch.set_grad_enabled(False)  # Completely disable gradients to save RAM
-        from langchain_huggingface import HuggingFaceEmbeddings
-        EMBEDDINGS = HuggingFaceEmbeddings(
-            model_name=EMBEDDING_MODEL_NAME,
-            model_kwargs={'device': 'cpu'}
-        )
-        logger.info(f"Loaded embedding model: {EMBEDDING_MODEL_NAME}")
-        gc.collect()
-    except Exception as e:
-        logger.error(f"Failed to load embeddings: {e}")
+def _init_llm():
+    """Initialize remote API LLMs (NVIDIA / Groq / OpenRouter) which use near 0 RAM."""
+    global LLM_AVAILABLE, LLM
+    if LLM is not None:
         return
 
-    if CROSS_ENCODER is None:
-        pass # Disabled to save memory on Render's 512MB free tier
-        # try:
-        #     from sentence_transformers import CrossEncoder
-        #     CROSS_ENCODER = CrossEncoder(CROSS_ENCODER_MODEL_NAME)
-        #     logger.info(f"Loaded CrossEncoder model: {CROSS_ENCODER_MODEL_NAME}")
-        # except Exception as e:
-        #     logger.error(f"Failed to load CrossEncoder: {e}")
-
-    # Load FAISS index
-    if FAISS_INDEX_PATH.exists():
-        try:
-            from langchain_community.vectorstores import FAISS
-            VECTORDB = FAISS.load_local(
-                str(FAISS_INDEX_PATH),
-                EMBEDDINGS,
-                allow_dangerous_deserialization=True,
-            )
-            logger.info(f"Loaded FAISS index from {FAISS_INDEX_PATH}")
-        except Exception as e:
-            logger.error(f"Failed to load FAISS index: {e}")
-    else:
-        logger.warning(f"FAISS index not found at {FAISS_INDEX_PATH}. Run ingest.py first.")
-
-    # Try NVIDIA Nemotron LLM first, then OpenRouter, then Groq
     nvidia_key = os.getenv("NVIDIA_API_KEY")
     openrouter_key = os.getenv("OPENROUTER_API_KEY")
     groq_key = os.getenv("GROQ_API_KEY")
@@ -132,8 +90,24 @@ def _init_components():
             )
             LLM_AVAILABLE = True
             logger.info(f"NVIDIA Nemotron LLM initialized successfully with model {model_name}")
+            return
         except Exception as e:
             logger.warning(f"Failed to initialize NVIDIA LLM: {e}")
+
+    if not LLM_AVAILABLE and groq_key:
+        try:
+            from langchain_groq import ChatGroq
+            LLM = ChatGroq(
+                model_name=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+                groq_api_key=groq_key,
+                temperature=0.3,
+                streaming=True,
+            )
+            LLM_AVAILABLE = True
+            logger.info("Groq LLM initialized successfully")
+            return
+        except Exception as e:
+            logger.warning(f"Failed to initialize Groq LLM: {e}")
 
     if not LLM_AVAILABLE and openrouter_key:
         try:
@@ -152,22 +126,44 @@ def _init_components():
             )
             LLM_AVAILABLE = True
             logger.info(f"OpenRouter LLM initialized successfully with model {model_name}")
+            return
         except Exception as e:
             logger.warning(f"Failed to initialize OpenRouter LLM: {e}")
 
-    if not LLM_AVAILABLE and groq_key:
-        try:
-            from langchain_groq import ChatGroq
-            LLM = ChatGroq(
-                model_name=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-                groq_api_key=groq_key,
-                temperature=0.3,
-                streaming=True,
+
+def _init_components():
+    """Lazy initialization of LLM, embeddings, and vector store."""
+    global LLM_AVAILABLE, LLM, EMBEDDINGS, VECTORDB, CROSS_ENCODER
+
+    _init_llm()
+
+    if EMBEDDINGS is not None or VECTORDB is not None:
+        return  # Already initialized
+
+    try:
+        import gc
+        import torch
+        torch.set_num_threads(1)  # Low memory mode
+        torch.set_grad_enabled(False)
+        from langchain_huggingface import HuggingFaceEmbeddings
+        EMBEDDINGS = HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL_NAME,
+            model_kwargs={'device': 'cpu'}
+        )
+        logger.info(f"Loaded embedding model: {EMBEDDING_MODEL_NAME}")
+        gc.collect()
+
+        # Load FAISS index if embeddings loaded
+        if FAISS_INDEX_PATH.exists():
+            from langchain_community.vectorstores import FAISS
+            VECTORDB = FAISS.load_local(
+                str(FAISS_INDEX_PATH),
+                EMBEDDINGS,
+                allow_dangerous_deserialization=True,
             )
-            LLM_AVAILABLE = True
-            logger.info("Groq LLM initialized successfully")
-        except Exception as e:
-            logger.warning(f"Failed to initialize Groq LLM: {e}")
+            logger.info(f"Loaded FAISS index from {FAISS_INDEX_PATH}")
+    except Exception as e:
+        logger.warning(f"Embeddings / FAISS in lightweight mode: {e}")
 
     if not LLM_AVAILABLE:
         logger.warning("No working LLM API key set. LLM features will use fallback mode.")

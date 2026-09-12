@@ -58,13 +58,7 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Could not connect to Redis: {e}. Caching disabled.")
         REDIS_CLIENT = None
 
-    # Pre-warm Multi-RAG components (embeddings & models) in the background so user requests are instant
-    try:
-        from multi_rag import _init_components
-        _init_components()
-        logger.info("Multi-RAG components pre-warmed successfully.")
-    except Exception as me:
-        logger.warning(f"Component pre-warming note: {me}")
+    # Yield immediately so Uvicorn binds to port in 1 second
     yield
     if REDIS_CLIENT:
         await REDIS_CLIENT.aclose()
