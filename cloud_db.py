@@ -224,20 +224,21 @@ async def login_farmer(identifier: str, password: str = "") -> Dict[str, Any]:
                     data = res.json()
                     if data and len(data) > 0:
                         user = data[0]
-                        if not password or user.get("password_hash") == pwd_hash or password == "password123":
-                            return {
-                                "success": True,
-                                "user": {
-                                    "id": user.get("id"),
-                                    "phone": user.get("phone"),
-                                    "email": user.get("email"),
-                                    "name": user.get("name"),
-                                    "location": user.get("location"),
-                                    "farm_size": user.get("farm_size"),
-                                    "main_crops": user.get("main_crops", "").split(", ") if user.get("main_crops") else ["Paddy"],
-                                    "storage": "supabase"
-                                }
+                        if password and user.get("password_hash") and user.get("password_hash") != pwd_hash:
+                            return {"success": False, "error": "Incorrect password. Please check and try again."}
+                        return {
+                            "success": True,
+                            "user": {
+                                "id": user.get("id"),
+                                "phone": user.get("phone"),
+                                "email": user.get("email"),
+                                "name": user.get("name"),
+                                "location": user.get("location"),
+                                "farm_size": user.get("farm_size"),
+                                "main_crops": user.get("main_crops", "").split(", ") if user.get("main_crops") else ["Paddy"],
+                                "storage": "supabase"
                             }
+                        }
         except Exception as e:
             logger.warning(f"Supabase login check fallback: {e}")
 
@@ -249,34 +250,26 @@ async def login_farmer(identifier: str, password: str = "") -> Dict[str, Any]:
             cursor.execute("SELECT * FROM farmers WHERE phone = ? OR email = ?", (clean_id, clean_id))
             row = cursor.fetchone()
             if row:
-                if not password or row["password_hash"] == pwd_hash or password == "password123":
-                    return {
-                        "success": True,
-                        "user": {
-                            "id": row["id"],
-                            "phone": row["phone"],
-                            "email": row["email"],
-                            "name": row["name"],
-                            "location": row["location"],
-                            "farm_size": row["farm_size"],
-                            "main_crops": row["main_crops"].split(", ") if row["main_crops"] else ["Paddy"],
-                            "storage": "local_sqlite"
-                        }
+                if password and row["password_hash"] and row["password_hash"] != pwd_hash:
+                    return {"success": False, "error": "Incorrect password. Please check and try again."}
+                return {
+                    "success": True,
+                    "user": {
+                        "id": row["id"],
+                        "phone": row["phone"],
+                        "email": row["email"],
+                        "name": row["name"],
+                        "location": row["location"],
+                        "farm_size": row["farm_size"],
+                        "main_crops": row["main_crops"].split(", ") if row["main_crops"] else ["Paddy"],
+                        "storage": "local_sqlite"
                     }
+                }
 
-        # Default Demo User if not yet registered
+        # If not registered in Supabase or SQLite, require Sign Up
         return {
-            "success": True,
-            "user": {
-                "id": str(uuid.uuid4()),
-                "phone": clean_id,
-                "email": f"{clean_id}@farmer.agrimitra.ai" if not "@" in clean_id else clean_id,
-                "name": "Ramesh Kumar",
-                "location": "Vijayawada, Andhra Pradesh",
-                "farm_size": "5 Acres",
-                "main_crops": ["Paddy", "Tomato", "Chilli"],
-                "storage": "demo"
-            }
+            "success": False,
+            "error": "No account found with this mobile number. Please click 'Sign Up' below to create your free farmer account."
         }
     except Exception as e:
         logger.error(f"Login error: {e}")
